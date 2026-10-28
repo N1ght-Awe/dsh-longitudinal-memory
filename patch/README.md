@@ -43,8 +43,6 @@ profileConfirmed // profile 只有主人确认过才注入
 ```bash
 # 在你的插件目录里（先备份）
 git apply --check p0-lifecycle.diff && git apply p0-lifecycle.diff
-# 跑单测（把 tests/lifecycle.test.mjs 放到插件根目录的 tests/ 下）
-node tests/lifecycle.test.mjs
 ```
 
 diff 对不上时不要硬打 —— 看上面 6 个接线点手工接，比盲打安全。

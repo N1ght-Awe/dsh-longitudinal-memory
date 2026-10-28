@@ -9,13 +9,13 @@
 - 许可：MIT（Copyright © 2026 reaxlll，全文见 [LICENSE](LICENSE)）
 - 上游地址：<https://github.com/reaxlll/dsh-workspace-recollection>
 
-本仓库 **不包含** 上游源码。`patch/p0-lifecycle.diff` 是相对上游的修改（diff 形式），
-`patch/tests/` 与 `tools/` 是本仓库新增的测试与工具。补丁中的修改部分同样以 MIT 发布。
+本仓库 **不包含** 上游源码，也**不包含任何真实记忆数据**。`patch/p0-lifecycle.diff` 是相对上游的修改（diff 形式），
+`tools/` 是本仓库新增的验证工具。补丁中的修改部分同样以 MIT 发布。
 
 ## 本仓库内容
 
 - `docs/design.zh.md`、`docs/ai-memory-survey.zh.md`：设计与调研文档，MIT
-- `patch/p0-lifecycle.diff`、`patch/tests/lifecycle.test.mjs`、`tools/*.mjs`：MIT
+- `patch/p0-lifecycle.diff`、`tools/*.mjs`：MIT
 
 ## 第三方引用
 
