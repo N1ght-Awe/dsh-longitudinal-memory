@@ -1,0 +1,4 @@
+# 统一换行：仓库里存 LF，检出时不跟随平台变化（补丁文件尤其怕 CRLF）
+* text=auto eol=lf
+*.png binary
+*.jpg binary

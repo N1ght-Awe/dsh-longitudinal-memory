@@ -1,0 +1,354 @@
+# P0：给记忆条目加生命周期字段（kind / at / importance / 事实键 / 取代链 / 归档）
+# 基线：dsh-workspace-recollection 2.5.0 + 本地身份分层/下载修复
+# 仅供阅读与移植参考；上下文与上游不一致，别直接 git apply 到上游
+
+--- a/lib/store-logic.js
++++ b/lib/store-logic.js
+@@ -9,6 +9,9 @@
+  *
+  * 从 index.js 拆出来还有个附带好处：这些逻辑与 DSH 运行时无关，
+  * 不需要假 ctx 就能测，所以能进 CI（既有的端到端脚本只能在有内核的机器上跑）。
++ *
++ * 2026-10-27（P0）新增「生命周期」一节：kind / at / importance / factKey / 取代链 / 归档。
++ * 这一版**只补字段、不参与渲染** —— 注入文本与 P0 之前逐字相同，是为了能安全跑几天看 diff。
+  */
+ 
+ /** 更新时间戳（取不到就当作最旧）。 */
+@@ -105,15 +108,15 @@
+ /**
+  * 工作区键：把路径归一化成可以当 Map 键 / 文件名的标识。
+  *
+- * 注意两点：结尾的分隔符要去掉（E:\foo 与 E:\foo\ 必须算同一个工作区）；
+- * Windows 的文件系统大小写不敏感，所以键统一转小写 —— 否则 E:\Foo 与 E:\foo 会分裂成两份记忆。
++ * 注意两点：结尾的分隔符要去掉（E:\\foo 与 E:\\foo\\ 必须算同一个工作区）；
++ * Windows 的文件系统大小写不敏感，所以键统一转小写 —— 否则 E:\\Foo 与 E:\\foo 会分裂成两份记忆。
+  * 这个函数同时被 store 与 sessions 用，所以放在这里共用。
+  */
+ const CASE_INSENSITIVE_FS = process.platform === "win32";
+ 
+ export function workspaceKey(cwd) {
+   if (typeof cwd !== "string") return "";
+-  let key = cwd.trim().replace(/[\\/]+$/, "");
++  let key = cwd.trim().replace(/[\\\\/]+$/, "");
+   if (key === "") return "";
+   if (CASE_INSENSITIVE_FS) key = key.toLowerCase();
+   return key;
+@@ -136,3 +139,132 @@
+   if (!Number.isFinite(number)) return fallback;
+   return Math.min(max, Math.max(min, Math.round(number)));
+ }
++
++/* ══════════════════════════════════════════════════════════════════
++ * 生命周期（P0）：kind / at / importance / 事实键 / 取代链 / 归档
++ *
++ * 这一节只做**补字段**，不参与任何渲染或检索 —— P1 才开始用。
++ * 全部是纯函数、幂等：同一份数据跑两遍结果一致（迁移可以放心重跑）。
++ * ══════════════════════════════════════════════════════════════════ */
++
++/** 记忆种类。`profile` 常驻注入、`fact` 只进索引、`event` 只 recall。 */
++export const MEMORY_KINDS = ["profile", "fact", "event"];
++
++/** 生命周期状态：active 在用 / superseded 被新值取代 / archived 归档（仍在库、可查）。 */
++export const MEMORY_STATES = ["active", "superseded", "archived"];
++
++export const ARCHIVE_REASONS = ["decay", "superseded", "capacity", "manual"];
++
++/**
++ * 「要记一辈子」的标签。命中就把重要度提到 1（不衰减）。
++ * 这批词是照 fish-memory 提炼提示词里那份「长期有效」清单抄的，别随手加。
++ */
++const DURABLE_TAGS = new Set([
++  "偏好", "约定", "称呼", "名字", "关系", "病史", "身体", "忌口",
++  "习惯", "日子", "纪念日", "经济", "性格", "底线",
++]);
++
++/** 会话导入的流水：天生是 event（那天发生的事），不是事实。 */
++const EPISODIC_TAGS = new Set(["会话导入"]);
++
++function tagsOf(entry) {
++  return entry !== null && typeof entry === "object" && Array.isArray(entry.tags) ? entry.tags : [];
++}
++
++function originOf(entry) {
++  return entry !== null && typeof entry === "object" && entry.source !== null && typeof entry.source === "object" &&
++    typeof entry.source.origin === "string" ? entry.source.origin : "";
++}
++
++/**
++ * 推出种类。**只推 event，不推 profile** ——
++ * profile 是人格层，只能由主人确认写入；自动推出来的「常驻层」就是灾难的开始。
++ */
++export function deriveKind(entry) {
++  if (entry === null || typeof entry !== "object") return "fact";
++  if (entry.meta === true) return "event"; // 施工/状态记录：生来会过期
++  if (tagsOf(entry).some((tag) => EPISODIC_TAGS.has(tag))) return "event";
++  return "fact";
++}
++
++/** 推出重要度：只有 1（不淡）和 0.5（按种类半衰期淡）两档，不用小数。 */
++export function deriveImportance(entry, kind) {
++  if (kind === "profile") return 1;
++  if (entry !== null && typeof entry === "object") {
++    if (entry.importance === 1 || entry.importance === 0.5) return entry.importance;
++  }
++  if (tagsOf(entry).some((tag) => DURABLE_TAGS.has(tag))) return 1;
++  return 0.5;
++}
++
++function textField(value) {
++  return typeof value === "string" ? value.trim() : "";
++}
++
++function eventTime(value) {
++  // 只收能解析的时间串；解析不出来就留空，别猜。
++  const raw = textField(value);
++  if (raw === "") return "";
++  return Number.isFinite(Date.parse(raw)) ? raw : "";
++}
++
++function clampUnit(value) {
++  // null / undefined / 空串 一律当「没有情绪」—— 别让 Number(null)=0 把它变成「情绪 0」。
++  if (value === null || value === undefined || value === "") return null;
++  const number = Number(value);
++  if (!Number.isFinite(number)) return null;
++  return Math.min(1, Math.max(0, number));
++}
++
++/**
++ * 补全一条记忆的生命周期字段。**只加不改**：
++ * 已有值原样保留（除非非法），缺的按规则推出来。
++ *
++ * @param {object} entry
++ * @returns {object} 新对象；入参不动
++ */
++export function normalizeLifecycle(entry) {
++  const base = entry !== null && typeof entry === "object" ? entry : {};
++  const kind = MEMORY_KINDS.includes(base.kind) ? base.kind : deriveKind(base);
++  const state = MEMORY_STATES.includes(base.state) ? base.state : "active";
++  const hits = Number.isInteger(base.hits) && base.hits >= 0 ? base.hits : 0;
++  const supersedes = Array.isArray(base.supersedes)
++    ? [...new Set(base.supersedes.filter((id) => typeof id === "string" && id !== ""))]
++    : [];
++  return {
++    ...base,
++    kind,
++    at: eventTime(base.at),
++    importance: deriveImportance(base, kind),
++    emotion: clampUnit(base.emotion),
++    factKey: textField(base.factKey),
++    supersedes,
++    supersededBy: textField(base.supersededBy),
++    invalidAt: eventTime(base.invalidAt),
++    hits,
++    lastHitAt: textField(base.lastHitAt),
++    state,
++    archiveReason: ARCHIVE_REASONS.includes(base.archiveReason) ? base.archiveReason : "",
++    archiveAt: eventTime(base.archiveAt),
++    profileConfirmed: base.profileConfirmed === "owner" ? "owner" : "",
++  };
++}
++
++/** 这条现在还算不算「在用」—— P2 的检索与索引会用到。 */
++export function isActive(entry) {
++  return entry !== null && typeof entry === "object" && (entry.state === undefined || entry.state === "active");
++}
++
++/** 生命周期字段清单（迁移测试用：剥掉它们之后必须与原数据逐字段一致）。 */
++export const LIFECYCLE_FIELDS = [
++  "kind", "at", "importance", "emotion", "factKey", "supersedes", "supersededBy",
++  "invalidAt", "hits", "lastHitAt", "state", "archiveReason", "archiveAt", "profileConfirmed",
++];
++
++/** 剥掉生命周期字段，用于「迁移只加不改」的比对。 */
++export function withoutLifecycle(entry) {
++  if (entry === null || typeof entry !== "object") return entry;
++  const copy = { ...entry };
++  for (const field of LIFECYCLE_FIELDS) delete copy[field];
++  return copy;
++}
+--- a/lib/migrate.js
++++ b/lib/migrate.js
+@@ -10,7 +10,11 @@
+  *      用户以为记忆丢了，其实文件还在磁盘上躺着。
+  *
+  * 这一层只负责**判断与计划**（纯函数，可单测）；备份、告警、只读保护由调用方执行。
++ *
++ * 2026-10-27（P0）：加 v3 → v4 —— 给每条记忆补生命周期字段（kind/at/importance/…）。
++ * 这一步**只加不改**：剥掉新字段后必须与原数据逐字段一致（有单测钉着）。
+  */
++import { normalizeLifecycle } from "./store-logic.js";
+ 
+ /** 版本关系判定：same / migrate / too-new / unknown。 */
+ export function decideVersion(diskVersion, currentVersion) {
+@@ -23,11 +27,25 @@
+ /**
+  * 迁移链：`from 版本 → 把该版本数据升一级的函数`。
+  *
+- * 目前是空的 —— 因为 v3（store）/ v2（vectors）就是当前版本，没有历史数据要搬。
+- * 骨架先立在这里的意义：**下一次改数据结构时，只要往表里加一条函数**，
+- * 老用户打开插件就会自动升级（而且在升级前已经备份过原文件）。
++ * v3 → v4：给每条记忆补生命周期字段。字段本身由 `store-logic.normalizeLifecycle`
++ * 推出来（幂等，跑两遍结果一致），这里只负责遍历与版本标记。
+  */
+-export const STORE_MIGRATIONS = new Map();
++export function storeV3ToV4(raw) {
++  const source = raw !== null && typeof raw === "object" ? raw : {};
++  const workspaces = source.workspaces !== null && typeof source.workspaces === "object" ? source.workspaces : {};
++  const next = {};
++  for (const [key, bucket] of Object.entries(workspaces)) {
++    if (bucket === null || typeof bucket !== "object") { next[key] = bucket; continue; }
++    const entries = Array.isArray(bucket.entries) ? bucket.entries : [];
++    next[key] = {
++      ...bucket,
++      entries: entries.map((entry) => (entry !== null && typeof entry === "object" ? normalizeLifecycle(entry) : entry)),
++    };
++  }
++  return { ...source, version: 4, workspaces: next };
++}
++
++export const STORE_MIGRATIONS = new Map([[3, storeV3ToV4]]);
+ export const VECTOR_MIGRATIONS = new Map();
+ 
+ /**
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -41,7 +41,7 @@
+ import { encodeVector, decodeVectorOfDim, isEncoded, normalizeChunks, migrateVectorsV2ToV3 } from "./vector-codec.js";
+ import { randomUUID } from "node:crypto";
+ import { processBirth, lockPayload, parseLock, lockState, lockNotice } from "./lock.js";
+-import { sortEntries, trimEntries, partitionRemoval, clampInt, workspaceKey } from "./store-logic.js";
++import { sortEntries, trimEntries, partitionRemoval, clampInt, workspaceKey, normalizeLifecycle, LIFECYCLE_FIELDS } from "./store-logic.js";
+ import { readSessionHeader, listSessionFiles, readSessionEvents, segmentSession, renderSegment } from "./sessions.js";
+ import { STORE_MIGRATIONS, VECTOR_MIGRATIONS, backupName, pickBackupsToKeep, resolveOnRead } from "./migrate.js";
+ 
+@@ -86,7 +86,8 @@
+ const SECTION_ORDER = -5;
+ const MAX_BODY_BYTES = 1 << 20;
+ 
+-const STORE_VERSION = 3;
++/** 存储版本：v4 = 每条记忆带生命周期字段（kind / at / importance / 事实键 / 取代链）。 */
++const STORE_VERSION = 4;
+ const VECTOR_VERSION = 3;
+ const EMBED_DIM = 512;
+ const MEMORY_FILE = "Memory.md";
+@@ -186,6 +187,30 @@
+   return entry.tags.length > 0 ? head + " #" + entry.tags.join(" #") : head;
+ }
+ 
++/**
++ * 把调用方给的生命周期字段写进条目；没给的字段保持原值。
++ * `fact_key` / `factKey` 两种写法都收（工具参数用下划线，存储用驼峰）。
++ */
++function applyLifecyclePatch(entry, patch) {
++  if (patch === null || typeof patch !== "object") return entry;
++  const pick = (snake, camel) => {
++    if (patch[snake] !== undefined) return patch[snake];
++    if (camel !== undefined && patch[camel] !== undefined) return patch[camel];
++    return entry[camel !== undefined ? camel : snake];
++  };
++  const merged = normalizeLifecycle({
++    ...entry,
++    kind: pick("kind"),
++    at: pick("at"),
++    importance: pick("importance"),
++    emotion: pick("emotion"),
++    factKey: pick("fact_key", "factKey"),
++    supersedes: pick("supersedes"),
++  });
++  for (const field of LIFECYCLE_FIELDS) entry[field] = merged[field];
++  return entry;
++}
++
+ /* ────────────────────────────── 记忆本体 ────────────────────────────── */
+ 
+ function normalizeEntry(raw) {
+@@ -199,7 +224,7 @@
+   const state = raw.summaryState === "ready" || raw.summaryState === "failed" || raw.summaryState === "manual" || raw.summaryState === "pending"
+     ? raw.summaryState
+     : (summary === "" ? "pending" : "ready");
+-  return {
++  const entry = {
+     id: typeof raw.id === "string" && raw.id !== "" ? raw.id : newId(),
+     text,
+     topic: typeof raw.topic === "string" ? raw.topic : "",
+@@ -223,6 +248,10 @@
+     createdAt,
+     updatedAt,
+   };
++  // P0：补生命周期字段（kind / at / importance / 事实键 / 取代链）。
++  // 只加不改 —— 渲染路径（indexLine / pinnedLine / renderMemoryMarkdown）不读这些字段，
++  // 所以注入文本与加字段之前逐字相同；这是 P0 的验收条件，别在这里顺手用它们。
++  return normalizeLifecycle(entry);
+ }
+ 
+ function normalizeBucket(raw) {
+@@ -477,12 +506,13 @@
+       existing.revision = (existing.revision || 1) + 1;
+       existing.sensitivity = sensitivityOf({ ...existing, ...input, source: existing.source });
+       if (input.topic) existing.topic = input.topic;
++      applyLifecyclePatch(existing, input);
+       existing.updatedAt = at;
+       bucket.updatedAt = at;
+       this.flush();
+       return { entry: existing, created: false, needsSummary: existing.summaryState === "pending" };
+     }
+-    const entry = {
++    const entry = normalizeLifecycle({
+       id: newId(),
+       text,
+       topic: input.topic || "",
+@@ -498,7 +528,8 @@
+       source: { sessionId: typeof sessionId === "string" ? sessionId : "", at, origin, workspace: typeof input.sourceWorkspace === "string" ? input.sourceWorkspace : cwd, ownerId: input.sourceOwner || "", personaId: input.sourcePersona || "" },
+       createdAt: at,
+       updatedAt: at,
+-    };
++    });
++    applyLifecyclePatch(entry, input);
+     bucket.entries.push(entry);
+     bucket.updatedAt = at;
+     this.trim(bucket);
+@@ -559,6 +590,7 @@
+     entry.topic = typeof patch.topic === "string" ? patch.topic : (entry.topic || "");
+     entry.sensitivity = sensitivityOf({ ...entry, ...patch });
+     entry.assertion = patch.assertion || entry.assertion || "observed";
++    applyLifecyclePatch(entry, patch);
+     entry.revision = (entry.revision || 1) + 1;
+     entry.updatedAt = nowIso();
+     bucket.updatedAt = entry.updatedAt;
+@@ -1854,6 +1886,27 @@
+         summary: { type: "string", description: "浅层一句话要点（60 字内，保留专有名词/路径/命令等关键词）。省略则自动 AI 总结。" },
+         tags: { type: "array", description: "分类标签，例如 偏好/项目/约定/踩坑/环境。最多 8 个。", items: { type: "string", description: "标签文字" } },
+         pinned: { type: "boolean", description: "置顶：索引里永远排最前，要点还会直接注入 system prompt。" },
++        kind: {
++          type: "string",
++          description:
++            "记忆种类：fact = 可查证的事实/结论/偏好细节（默认）；event = 那天发生的事（会淡出索引，只在被问到时翻出来）；" +
++            "profile = 人格与长期习惯（只有主人明确说\"记住这个\"时才用，会常驻注入）。",
++        },
++        at: {
++          type: "string",
++          description: "事情**发生**的时间（ISO，如 2026-10-26T21:05:00+08:00）。补记往事时必须填；就是现在说话就不用填。",
++        },
++        importance: {
++          type: "number",
++          description: "1 = 要记一辈子（称呼/偏好/约定/关系/病史/重要日子）；0.5 = 平常（默认）。拿不准就别填。",
++        },
++        emotion: { type: "number", description: "当时的情绪强度 0~1。只有真带情绪才填，别给每句话都标。" },
++        fact_key: {
++          type: "string",
++          description:
++            "会变化的事共用一个键，写成「对象.方面」，如 饮品偏好、约定.称呼。同一键的新条目会取代旧的（旧的仍可回溯）。" +
++            "**键里不许写具体的值**（写 饮品偏好，别写 饮品偏好-美式）；拿不准就留空。",
++        },
+         meta: {
+           type: "boolean",
+           description:
+@@ -1891,7 +1944,7 @@
+           const origin = writable.origins.get(args.replace_id);
+           if (!origin) throw new Error("不能更正不存在或无写入权限的条目");
+           cwd = origin.cwd;
+-          const updated = store.update(cwd, args.replace_id, { text: args.text, summary: args.summary ?? "", tags: args.tags, pinned: args.pinned, topic: args.topic, sensitivity: args.sensitivity });
++          const updated = store.update(cwd, args.replace_id, { text: args.text, summary: args.summary ?? "", tags: args.tags, pinned: args.pinned, topic: args.topic, sensitivity: args.sensitivity, kind: args.kind, at: args.at, importance: args.importance, emotion: args.emotion, fact_key: args.fact_key });
+           result = { entry: updated.entry, created: false, needsSummary: updated.entry.summaryState === "pending" };
+           vectors.drop(cwd, [args.replace_id]);
+         } else result = store.add(cwd, { ...args, sourceWorkspace: sourceCwd, sourceOwner: identity.kind === "private" ? identity.ownerId : "", sourcePersona: identity.kind === "private" ? identity.personaId : "" }, "agent", sessionIdOf(exec));
